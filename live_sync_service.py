@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse, Response
 ASANA_API_BASE = "https://app.asana.com/api/1.0"
 AIRTABLE_API_BASE = "https://api.airtable.com/v0"
 AIRTABLE_META_API_BASE = "https://api.airtable.com/v0/meta"
+DEFAULT_PUBLIC_BASE_URL = "https://asana-data-layer-beryl.vercel.app"
 
 GOAL_FIELDS = ",".join(
     [
@@ -162,15 +163,12 @@ class Settings:
     def from_env(cls) -> "Settings":
         asana_access_token = os.environ.get("ASANA_ACCESS_TOKEN", "").strip()
         airtable_token = os.environ.get("AIRTABLE_TOKEN", "").strip()
-        public_base_url = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
+        public_base_url = os.environ.get("PUBLIC_BASE_URL", DEFAULT_PUBLIC_BASE_URL).strip().rstrip("/")
 
         if not asana_access_token:
             raise RuntimeError("Missing ASANA_ACCESS_TOKEN")
         if not airtable_token:
             raise RuntimeError("Missing AIRTABLE_TOKEN")
-        if not public_base_url:
-            raise RuntimeError("Missing PUBLIC_BASE_URL")
-
         return cls(
             asana_access_token=asana_access_token,
             airtable_token=airtable_token,
@@ -432,7 +430,7 @@ except Exception as exc:  # pragma: no cover - keeps the app importable on misco
         airtable_token="",
         airtable_base_id=os.environ.get("AIRTABLE_BASE_ID", "app3mkbiuKcaANHa7").strip(),
         workspace_gid=os.environ.get("ASANA_WORKSPACE_GID", "1204848198937008").strip(),
-        public_base_url=os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/"),
+        public_base_url=os.environ.get("PUBLIC_BASE_URL", DEFAULT_PUBLIC_BASE_URL).strip().rstrip("/"),
         admin_api_key=os.environ.get("ADMIN_API_KEY", "").strip() or None,
         webhook_secret_store=Path(
             os.environ.get("WEBHOOK_SECRET_STORE", "live_sync_webhook_secrets.json")
