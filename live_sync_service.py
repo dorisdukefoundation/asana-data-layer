@@ -973,15 +973,19 @@ def bootstrap_sync(
     project_refs = all_project_refs()
     project_batch = slice_items(project_refs, task_offset, task_limit)
     created_task_webhooks = []
+    task_errors = []
     if settings.enable_tasks:
         for project in project_batch:
-            created_task_webhooks.append(
-                asana.create_webhook(
-                    project["gid"],
-                    f"{settings.public_base_url}/webhooks/asana/project/{project['gid']}",
-                    PROJECT_TASK_WEBHOOK_FILTERS,
+            try:
+                created_task_webhooks.append(
+                    asana.create_webhook(
+                        project["gid"],
+                        f"{settings.public_base_url}/webhooks/asana/project/{project['gid']}",
+                        PROJECT_TASK_WEBHOOK_FILTERS,
+                    )
                 )
-            )
+            except Exception as exc:
+                task_errors.append({"project_gid": project.get("gid"), "error": str(exc)})
             time.sleep(0.03)
 
     return {
@@ -990,7 +994,9 @@ def bootstrap_sync(
         "task_webhook_limit": task_limit,
         "task_webhook_total_projects": len(project_refs),
         "task_webhook_count": len(created_task_webhooks),
+        "task_webhook_failed": len(task_errors),
         "remaining_task_webhook_projects": max(len(project_refs) - (task_offset + len(project_batch)), 0),
+        "task_webhook_errors": task_errors,
     }
 
 
@@ -1018,14 +1024,18 @@ def bootstrap_task_webhooks(
     project_refs = all_project_refs()
     project_batch = slice_items(project_refs, offset, limit)
     created_task_webhooks = []
+    errors = []
     for project in project_batch:
-        created_task_webhooks.append(
-            asana.create_webhook(
-                project["gid"],
-                f"{settings.public_base_url}/webhooks/asana/project/{project['gid']}",
-                PROJECT_TASK_WEBHOOK_FILTERS,
+        try:
+            created_task_webhooks.append(
+                asana.create_webhook(
+                    project["gid"],
+                    f"{settings.public_base_url}/webhooks/asana/project/{project['gid']}",
+                    PROJECT_TASK_WEBHOOK_FILTERS,
+                )
             )
-        )
+        except Exception as exc:
+            errors.append({"project_gid": project.get("gid"), "error": str(exc)})
         time.sleep(0.03)
 
     return {
@@ -1033,7 +1043,9 @@ def bootstrap_task_webhooks(
         "limit": limit,
         "total_projects": len(project_refs),
         "created_task_webhooks": len(created_task_webhooks),
+        "failed_task_webhooks": len(errors),
         "remaining_projects": max(len(project_refs) - (offset + len(project_batch)), 0),
+        "errors": errors,
     }
 
 
