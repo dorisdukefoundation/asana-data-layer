@@ -136,6 +136,20 @@ TASK_FIELDS = ",".join(
     ]
 )
 
+TEAM_FIELDS = ",".join(
+    [
+        "gid",
+        "name",
+        "resource_type",
+        "description",
+        "html_description",
+        "visibility",
+        "organization.gid",
+        "organization.name",
+        "permalink_url",
+    ]
+)
+
 
 def env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
@@ -156,6 +170,7 @@ class Settings:
     webhook_secrets_table: str
     goals_table: str
     projects_table: str
+    teams_table: str
     tasks_table: str
     enable_tasks: bool
     auto_create_tasks_table: bool
@@ -185,6 +200,7 @@ class Settings:
             ).strip(),
             goals_table=os.environ.get("AIRTABLE_GOALS_TABLE", "Asana Goals").strip(),
             projects_table=os.environ.get("AIRTABLE_PROJECTS_TABLE", "Asana Projects").strip(),
+            teams_table=os.environ.get("AIRTABLE_TEAMS_TABLE", "Asana Teams").strip(),
             tasks_table=os.environ.get("AIRTABLE_TASKS_TABLE", "Asana Tasks").strip(),
             enable_tasks=env_bool("ENABLE_TASKS_SYNC", True),
             auto_create_tasks_table=env_bool("AUTO_CREATE_TASKS_TABLE", True),
@@ -342,6 +358,22 @@ class AsanaClient:
             params={"opt_fields": PROJECT_FIELDS},
         )["data"]
 
+    def list_teams(self) -> list[dict]:
+        return self.paginate(
+            f"/workspaces/{self.workspace_gid}/teams",
+            params={
+                "limit": 100,
+                "opt_fields": TEAM_FIELDS,
+            },
+        )
+
+    def get_team(self, team_gid: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/teams/{team_gid}",
+            params={"opt_fields": TEAM_FIELDS},
+        )["data"]
+
     def get_task(self, task_gid: str) -> dict[str, Any]:
         return self._request(
             "GET",
@@ -477,6 +509,7 @@ except Exception as exc:  # pragma: no cover - keeps the app importable on misco
         ).strip(),
         goals_table=os.environ.get("AIRTABLE_GOALS_TABLE", "Asana Goals").strip(),
         projects_table=os.environ.get("AIRTABLE_PROJECTS_TABLE", "Asana Projects").strip(),
+        teams_table=os.environ.get("AIRTABLE_TEAMS_TABLE", "Asana Teams").strip(),
         tasks_table=os.environ.get("AIRTABLE_TASKS_TABLE", "Asana Tasks").strip(),
         enable_tasks=env_bool("ENABLE_TASKS_SYNC", True),
         auto_create_tasks_table=env_bool("AUTO_CREATE_TASKS_TABLE", True),
@@ -532,6 +565,11 @@ def all_project_refs() -> list[dict[str, Any]]:
 def all_goal_refs() -> list[dict[str, Any]]:
     require_runtime_config()
     return dedupe_by_gid(asana.list_goals(False) + asana.list_goals(True))
+
+
+def all_team_refs() -> list[dict[str, Any]]:
+    require_runtime_config()
+    return dedupe_by_gid(asana.list_teams())
 
 
 def slice_items(items: list[dict[str, Any]], offset: int, limit: int) -> list[dict[str, Any]]:
@@ -769,6 +807,34 @@ def sync_project(project_gid: str) -> dict[str, Any]:
     return {"project_gid": project_gid, "field_count": len(filtered)}
 
 
+def sync_team(team_gid: str) -> dict[str, Any]:
+    require_runtime_config()
+    try:
+        team = asana.get_team(team_gid)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            deleted = delete_from_airtable(settings.teams_table, "team_gid", team_gid)
+            return {"team_gid": team_gid, "deleted_records": deleted}
+        raise
+
+    organization = team.get("organization") or {}
+    row = {
+        "team_gid": team.get("gid"),
+        "team_name": team.get("name"),
+        "resource_type": team.get("resource_type"),
+        "description": team.get("description"),
+        "html_description": team.get("html_description"),
+        "visibility": team.get("visibility"),
+        "organization_gid": organization.get("gid"),
+        "organization_name": organization.get("name"),
+        "permalink_url": team.get("permalink_url"),
+        "raw_team_json": json.dumps(team, ensure_ascii=False, sort_keys=True),
+    }
+    filtered = filter_for_existing_fields(settings.teams_table, row)
+    airtable.upsert_records(settings.teams_table, "team_gid", [filtered])
+    return {"team_gid": team_gid, "field_count": len(filtered)}
+
+
 def sync_task(task_gid: str) -> dict[str, Any]:
     require_runtime_config()
     maybe_task_table()
@@ -837,6 +903,9 @@ WORKSPACE_WEBHOOK_FILTERS = [
     for action in ("added", "removed", "deleted", "undeleted", "changed")
 ] + [
     {"resource_type": "project", "action": action}
+    for action in ("added", "removed", "deleted", "undeleted", "changed")
+ ] + [
+    {"resource_type": "team", "action": action}
     for action in ("added", "removed", "deleted", "undeleted", "changed")
 ]
 
@@ -911,6 +980,8 @@ async def asana_workspace_webhook(
             results.append(sync_goal(resource_gid))
         elif resource_type == "project":
             results.append(sync_project(resource_gid))
+        elif resource_type == "team":
+            results.append(sync_team(resource_gid))
 
     return JSONResponse({"processed": len(results), "results": results})
 
@@ -1091,6 +1162,27 @@ def backfill_projects(
     }
 
 
+@app.post("/admin/backfill/teams")
+def backfill_teams(
+    x_admin_key: Optional[str] = Header(default=None),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=25, ge=1, le=250),
+) -> dict[str, Any]:
+    require_runtime_config()
+    require_admin_key(x_admin_key)
+    team_refs = all_team_refs()
+    batch = slice_items(team_refs, offset, limit)
+    results = [sync_team(team["gid"]) for team in batch]
+    return {
+        "synced": len(results),
+        "offset": offset,
+        "limit": limit,
+        "total_teams": len(team_refs),
+        "remaining_teams": max(len(team_refs) - (offset + len(batch)), 0),
+        "results": results,
+    }
+
+
 @app.post("/admin/backfill/tasks")
 def backfill_tasks(
     project_gid: Optional[str] = None,
@@ -1130,12 +1222,14 @@ def backfill_all(
     x_admin_key: Optional[str] = Header(default=None),
     goals_limit: int = Query(default=25, ge=1, le=250),
     projects_limit: int = Query(default=25, ge=1, le=250),
+    teams_limit: int = Query(default=25, ge=1, le=250),
     task_project_limit: int = Query(default=10, ge=1, le=100),
 ) -> dict[str, Any]:
     require_runtime_config()
     require_admin_key(x_admin_key)
     goals = backfill_goals(x_admin_key=x_admin_key, offset=0, limit=goals_limit)
     projects = backfill_projects(x_admin_key=x_admin_key, offset=0, limit=projects_limit)
+    teams = backfill_teams(x_admin_key=x_admin_key, offset=0, limit=teams_limit)
     tasks = (
         backfill_tasks(project_gid=None, x_admin_key=x_admin_key, offset=0, limit=task_project_limit)
         if settings.enable_tasks
@@ -1144,9 +1238,11 @@ def backfill_all(
     return {
         "goals": goals["synced"],
         "projects": projects["synced"],
+        "teams": teams["synced"],
         "tasks": tasks["synced"],
         "remaining_goals": goals.get("remaining_goals", 0),
         "remaining_projects": projects.get("remaining_projects", 0),
+        "remaining_teams": teams.get("remaining_teams", 0),
         "remaining_task_projects": tasks.get("remaining_projects", 0),
     }
 
@@ -1161,6 +1257,7 @@ def config(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
         "base_id": settings.airtable_base_id,
         "goals_table": settings.goals_table,
         "projects_table": settings.projects_table,
+        "teams_table": settings.teams_table,
         "tasks_table": settings.tasks_table,
         "webhook_secrets_table": settings.webhook_secrets_table,
         "public_base_url": settings.public_base_url,
