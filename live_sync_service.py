@@ -757,6 +757,16 @@ PROJECT_TASK_WEBHOOK_FILTERS = [
 ]
 
 
+@app.get("/")
+def root() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": "asana-data-layer",
+        "workspace_gid": settings.workspace_gid,
+        "base_id": settings.airtable_base_id,
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
     return {
