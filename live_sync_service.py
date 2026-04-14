@@ -153,6 +153,7 @@ class Settings:
     public_base_url: str
     admin_api_key: Optional[str]
     webhook_secret_store: Path
+    webhook_secrets_table: str
     goals_table: str
     projects_table: str
     tasks_table: str
@@ -179,6 +180,9 @@ class Settings:
             webhook_secret_store=Path(
                 os.environ.get("WEBHOOK_SECRET_STORE", "live_sync_webhook_secrets.json")
             ),
+            webhook_secrets_table=os.environ.get(
+                "AIRTABLE_WEBHOOK_SECRETS_TABLE", "Asana Webhook Secrets"
+            ).strip(),
             goals_table=os.environ.get("AIRTABLE_GOALS_TABLE", "Asana Goals").strip(),
             projects_table=os.environ.get("AIRTABLE_PROJECTS_TABLE", "Asana Projects").strip(),
             tasks_table=os.environ.get("AIRTABLE_TASKS_TABLE", "Asana Tasks").strip(),
@@ -188,9 +192,29 @@ class Settings:
 
 
 class SecretStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        airtable_client: Optional["AirtableClient"] = None,
+        table_name: str = "Asana Webhook Secrets",
+    ) -> None:
         self.path = path
+        self.airtable = airtable_client
+        self.table_name = table_name
         self.lock = threading.Lock()
+
+    def _ensure_table(self) -> None:
+        if not self.airtable:
+            return
+        if self.airtable.get_field_map(self.table_name):
+            return
+        self.airtable.create_table(
+            self.table_name,
+            [
+                {"name": "secret_key", "type": "singleLineText"},
+                {"name": "secret_value", "type": "multilineText"},
+            ],
+        )
 
     def _load(self) -> dict[str, str]:
         if not self.path.exists():
@@ -200,10 +224,23 @@ class SecretStore:
 
     def get(self, key: str) -> Optional[str]:
         with self.lock:
+            if self.airtable:
+                self._ensure_table()
+                records = self.airtable.find_records_by_value(self.table_name, "secret_key", key)
+                if records:
+                    return (records[0].get("fields") or {}).get("secret_value")
             return self._load().get(key)
 
     def set(self, key: str, value: str) -> None:
         with self.lock:
+            if self.airtable:
+                self._ensure_table()
+                self.airtable.upsert_records(
+                    self.table_name,
+                    "secret_key",
+                    [{"secret_key": key, "secret_value": value}],
+                )
+                return
             payload = self._load()
             payload[key] = value
             with self.path.open("w", encoding="utf-8") as outfile:
@@ -435,6 +472,9 @@ except Exception as exc:  # pragma: no cover - keeps the app importable on misco
         webhook_secret_store=Path(
             os.environ.get("WEBHOOK_SECRET_STORE", "live_sync_webhook_secrets.json")
         ),
+        webhook_secrets_table=os.environ.get(
+            "AIRTABLE_WEBHOOK_SECRETS_TABLE", "Asana Webhook Secrets"
+        ).strip(),
         goals_table=os.environ.get("AIRTABLE_GOALS_TABLE", "Asana Goals").strip(),
         projects_table=os.environ.get("AIRTABLE_PROJECTS_TABLE", "Asana Projects").strip(),
         tasks_table=os.environ.get("AIRTABLE_TASKS_TABLE", "Asana Tasks").strip(),
@@ -444,7 +484,11 @@ except Exception as exc:  # pragma: no cover - keeps the app importable on misco
     asana = None
     airtable = None
 
-secrets = SecretStore(settings.webhook_secret_store)
+secrets = SecretStore(
+    settings.webhook_secret_store,
+    airtable_client=airtable,
+    table_name=settings.webhook_secrets_table,
+)
 app = FastAPI(title="Asana Airtable Live Sync")
 
 
@@ -1106,6 +1150,7 @@ def config(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
         "goals_table": settings.goals_table,
         "projects_table": settings.projects_table,
         "tasks_table": settings.tasks_table,
+        "webhook_secrets_table": settings.webhook_secrets_table,
         "public_base_url": settings.public_base_url,
         "enable_tasks": settings.enable_tasks,
         "tables_present": list(airtable.list_tables().keys()),
