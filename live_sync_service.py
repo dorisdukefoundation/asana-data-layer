@@ -948,21 +948,20 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.post("/webhooks/asana/workspace")
-async def asana_workspace_webhook(
+async def handle_workspace_webhook(
+    secret_key: str,
     request: Request,
     x_hook_secret: Optional[str] = Header(default=None),
     x_hook_signature: Optional[str] = Header(default=None),
 ) -> Response:
     require_runtime_config()
-    key = f"workspace:{settings.workspace_gid}"
     body = await request.body()
 
     if x_hook_secret:
-        secrets.set(key, x_hook_secret)
+        secrets.set(secret_key, x_hook_secret)
         return Response(status_code=204, headers={"X-Hook-Secret": x_hook_secret})
 
-    stored = secrets.get(key)
+    stored = secrets.get(secret_key)
     if not stored or not x_hook_signature or not verify_signature(body, x_hook_signature, stored):
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
@@ -984,6 +983,34 @@ async def asana_workspace_webhook(
             results.append(sync_team(resource_gid))
 
     return JSONResponse({"processed": len(results), "results": results})
+
+
+@app.post("/webhooks/asana/workspace")
+async def asana_workspace_webhook(
+    request: Request,
+    x_hook_secret: Optional[str] = Header(default=None),
+    x_hook_signature: Optional[str] = Header(default=None),
+) -> Response:
+    return await handle_workspace_webhook(
+        f"workspace:{settings.workspace_gid}",
+        request,
+        x_hook_secret,
+        x_hook_signature,
+    )
+
+
+@app.post("/webhooks/asana/workspace-v2")
+async def asana_workspace_webhook_v2(
+    request: Request,
+    x_hook_secret: Optional[str] = Header(default=None),
+    x_hook_signature: Optional[str] = Header(default=None),
+) -> Response:
+    return await handle_workspace_webhook(
+        f"workspace-v2:{settings.workspace_gid}",
+        request,
+        x_hook_secret,
+        x_hook_signature,
+    )
 
 
 @app.post("/webhooks/asana/project/{project_gid}")
@@ -1078,6 +1105,18 @@ def bootstrap_workspace_webhook(x_admin_key: Optional[str] = Header(default=None
     workspace_webhook = asana.create_webhook(
         settings.workspace_gid,
         f"{settings.public_base_url}/webhooks/asana/workspace",
+        WORKSPACE_WEBHOOK_FILTERS,
+    )
+    return {"workspace_webhook_gid": workspace_webhook.get("gid")}
+
+
+@app.post("/admin/bootstrap/workspace-v2")
+def bootstrap_workspace_webhook_v2(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_runtime_config()
+    require_admin_key(x_admin_key)
+    workspace_webhook = asana.create_webhook(
+        settings.workspace_gid,
+        f"{settings.public_base_url}/webhooks/asana/workspace-v2",
         WORKSPACE_WEBHOOK_FILTERS,
     )
     return {"workspace_webhook_gid": workspace_webhook.get("gid")}
