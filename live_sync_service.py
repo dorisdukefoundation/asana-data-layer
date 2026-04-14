@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 
 
@@ -480,6 +480,20 @@ def join_gids(items: list[dict[str, Any]]) -> str:
     return ";".join(item.get("gid", "") for item in items if item.get("gid"))
 
 
+def all_project_refs() -> list[dict[str, Any]]:
+    require_runtime_config()
+    return dedupe_by_gid(asana.list_projects(archived=False) + asana.list_projects(archived=True))
+
+
+def all_goal_refs() -> list[dict[str, Any]]:
+    require_runtime_config()
+    return dedupe_by_gid(asana.list_goals(False) + asana.list_goals(True))
+
+
+def slice_items(items: list[dict[str, Any]], offset: int, limit: int) -> list[dict[str, Any]]:
+    return items[offset : offset + limit]
+
+
 def maybe_task_table() -> None:
     require_runtime_config()
     if not settings.enable_tasks:
@@ -896,20 +910,27 @@ async def asana_project_webhook(
 
 
 @app.post("/admin/bootstrap")
-def bootstrap_sync(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def bootstrap_sync(
+    x_admin_key: Optional[str] = Header(default=None),
+    task_offset: int = Query(default=0, ge=0),
+    task_limit: int = Query(default=25, ge=1, le=100),
+) -> dict[str, Any]:
     require_runtime_config()
     require_admin_key(x_admin_key)
     maybe_task_table()
-    workspace_webhook = asana.create_webhook(
-        settings.workspace_gid,
-        f"{settings.public_base_url}/webhooks/asana/workspace",
-        WORKSPACE_WEBHOOK_FILTERS,
-    )
+    workspace_webhook = None
+    if task_offset == 0:
+        workspace_webhook = asana.create_webhook(
+            settings.workspace_gid,
+            f"{settings.public_base_url}/webhooks/asana/workspace",
+            WORKSPACE_WEBHOOK_FILTERS,
+        )
 
-    project_refs = dedupe_by_gid(asana.list_projects(archived=False) + asana.list_projects(archived=True))
+    project_refs = all_project_refs()
+    project_batch = slice_items(project_refs, task_offset, task_limit)
     created_task_webhooks = []
     if settings.enable_tasks:
-        for project in project_refs:
+        for project in project_batch:
             created_task_webhooks.append(
                 asana.create_webhook(
                     project["gid"],
@@ -920,61 +941,158 @@ def bootstrap_sync(x_admin_key: Optional[str] = Header(default=None)) -> dict[st
             time.sleep(0.03)
 
     return {
-        "workspace_webhook_gid": workspace_webhook.get("gid"),
+        "workspace_webhook_gid": workspace_webhook.get("gid") if workspace_webhook else None,
+        "task_webhook_offset": task_offset,
+        "task_webhook_limit": task_limit,
+        "task_webhook_total_projects": len(project_refs),
         "task_webhook_count": len(created_task_webhooks),
+        "remaining_task_webhook_projects": max(len(project_refs) - (task_offset + len(project_batch)), 0),
+    }
+
+
+@app.post("/admin/bootstrap/workspace")
+def bootstrap_workspace_webhook(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_runtime_config()
+    require_admin_key(x_admin_key)
+    workspace_webhook = asana.create_webhook(
+        settings.workspace_gid,
+        f"{settings.public_base_url}/webhooks/asana/workspace",
+        WORKSPACE_WEBHOOK_FILTERS,
+    )
+    return {"workspace_webhook_gid": workspace_webhook.get("gid")}
+
+
+@app.post("/admin/bootstrap/tasks")
+def bootstrap_task_webhooks(
+    x_admin_key: Optional[str] = Header(default=None),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=25, ge=1, le=100),
+) -> dict[str, Any]:
+    require_runtime_config()
+    require_admin_key(x_admin_key)
+    maybe_task_table()
+    project_refs = all_project_refs()
+    project_batch = slice_items(project_refs, offset, limit)
+    created_task_webhooks = []
+    for project in project_batch:
+        created_task_webhooks.append(
+            asana.create_webhook(
+                project["gid"],
+                f"{settings.public_base_url}/webhooks/asana/project/{project['gid']}",
+                PROJECT_TASK_WEBHOOK_FILTERS,
+            )
+        )
+        time.sleep(0.03)
+
+    return {
+        "offset": offset,
+        "limit": limit,
+        "total_projects": len(project_refs),
+        "created_task_webhooks": len(created_task_webhooks),
+        "remaining_projects": max(len(project_refs) - (offset + len(project_batch)), 0),
     }
 
 
 @app.post("/admin/backfill/goals")
-def backfill_goals(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def backfill_goals(
+    x_admin_key: Optional[str] = Header(default=None),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=25, ge=1, le=250),
+) -> dict[str, Any]:
     require_runtime_config()
     require_admin_key(x_admin_key)
-    goal_refs = dedupe_by_gid(asana.list_goals(False) + asana.list_goals(True))
-    results = [sync_goal(goal["gid"]) for goal in goal_refs]
-    return {"synced": len(results), "results": results}
+    goal_refs = all_goal_refs()
+    batch = slice_items(goal_refs, offset, limit)
+    results = [sync_goal(goal["gid"]) for goal in batch]
+    return {
+        "synced": len(results),
+        "offset": offset,
+        "limit": limit,
+        "total_goals": len(goal_refs),
+        "remaining_goals": max(len(goal_refs) - (offset + len(batch)), 0),
+        "results": results,
+    }
 
 
 @app.post("/admin/backfill/projects")
-def backfill_projects(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def backfill_projects(
+    x_admin_key: Optional[str] = Header(default=None),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=25, ge=1, le=250),
+) -> dict[str, Any]:
     require_runtime_config()
     require_admin_key(x_admin_key)
-    project_refs = dedupe_by_gid(asana.list_projects(False) + asana.list_projects(True))
-    results = [sync_project(project["gid"]) for project in project_refs]
-    return {"synced": len(results), "results": results}
+    project_refs = all_project_refs()
+    batch = slice_items(project_refs, offset, limit)
+    results = [sync_project(project["gid"]) for project in batch]
+    return {
+        "synced": len(results),
+        "offset": offset,
+        "limit": limit,
+        "total_projects": len(project_refs),
+        "remaining_projects": max(len(project_refs) - (offset + len(batch)), 0),
+        "results": results,
+    }
 
 
 @app.post("/admin/backfill/tasks")
 def backfill_tasks(
     project_gid: Optional[str] = None,
     x_admin_key: Optional[str] = Header(default=None),
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=10, ge=1, le=100),
 ) -> dict[str, Any]:
     require_runtime_config()
     require_admin_key(x_admin_key)
     maybe_task_table()
 
     project_gids = [project_gid] if project_gid else [
-        project["gid"] for project in dedupe_by_gid(asana.list_projects(False) + asana.list_projects(True))
+        project["gid"] for project in all_project_refs()
     ]
+    project_batch = project_gids[offset : offset + limit]
     seen_tasks: set[str] = set()
     results = []
-    for current_project_gid in project_gids:
+    for current_project_gid in project_batch:
         for task in asana.list_tasks_for_project(current_project_gid):
             task_gid = task.get("gid")
             if not task_gid or task_gid in seen_tasks:
                 continue
             seen_tasks.add(task_gid)
             results.append(sync_task(task_gid))
-    return {"synced": len(results), "results": results}
+    return {
+        "synced": len(results),
+        "offset": offset,
+        "limit": limit,
+        "total_projects": len(project_gids),
+        "remaining_projects": max(len(project_gids) - (offset + len(project_batch)), 0),
+        "results": results,
+    }
 
 
 @app.post("/admin/backfill/all")
-def backfill_all(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+def backfill_all(
+    x_admin_key: Optional[str] = Header(default=None),
+    goals_limit: int = Query(default=25, ge=1, le=250),
+    projects_limit: int = Query(default=25, ge=1, le=250),
+    task_project_limit: int = Query(default=10, ge=1, le=100),
+) -> dict[str, Any]:
     require_runtime_config()
     require_admin_key(x_admin_key)
-    goals = backfill_goals(x_admin_key)
-    projects = backfill_projects(x_admin_key)
-    tasks = backfill_tasks(None, x_admin_key) if settings.enable_tasks else {"synced": 0}
-    return {"goals": goals["synced"], "projects": projects["synced"], "tasks": tasks["synced"]}
+    goals = backfill_goals(x_admin_key=x_admin_key, offset=0, limit=goals_limit)
+    projects = backfill_projects(x_admin_key=x_admin_key, offset=0, limit=projects_limit)
+    tasks = (
+        backfill_tasks(project_gid=None, x_admin_key=x_admin_key, offset=0, limit=task_project_limit)
+        if settings.enable_tasks
+        else {"synced": 0}
+    )
+    return {
+        "goals": goals["synced"],
+        "projects": projects["synced"],
+        "tasks": tasks["synced"],
+        "remaining_goals": goals.get("remaining_goals", 0),
+        "remaining_projects": projects.get("remaining_projects", 0),
+        "remaining_task_projects": tasks.get("remaining_projects", 0),
+    }
 
 
 @app.get("/admin/config")
