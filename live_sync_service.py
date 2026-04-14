@@ -419,9 +419,33 @@ class AirtableClient:
             self._request("DELETE", url)
 
 
-settings = Settings.from_env()
-asana = AsanaClient(settings.asana_access_token, settings.workspace_gid)
-airtable = AirtableClient(settings.airtable_token, settings.airtable_base_id)
+CONFIG_ERROR: Optional[str] = None
+
+try:
+    settings = Settings.from_env()
+    asana = AsanaClient(settings.asana_access_token, settings.workspace_gid)
+    airtable = AirtableClient(settings.airtable_token, settings.airtable_base_id)
+except Exception as exc:  # pragma: no cover - keeps the app importable on misconfigured deploys
+    CONFIG_ERROR = str(exc)
+    settings = Settings(
+        asana_access_token="",
+        airtable_token="",
+        airtable_base_id=os.environ.get("AIRTABLE_BASE_ID", "app3mkbiuKcaANHa7").strip(),
+        workspace_gid=os.environ.get("ASANA_WORKSPACE_GID", "1204848198937008").strip(),
+        public_base_url=os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/"),
+        admin_api_key=os.environ.get("ADMIN_API_KEY", "").strip() or None,
+        webhook_secret_store=Path(
+            os.environ.get("WEBHOOK_SECRET_STORE", "live_sync_webhook_secrets.json")
+        ),
+        goals_table=os.environ.get("AIRTABLE_GOALS_TABLE", "Asana Goals").strip(),
+        projects_table=os.environ.get("AIRTABLE_PROJECTS_TABLE", "Asana Projects").strip(),
+        tasks_table=os.environ.get("AIRTABLE_TASKS_TABLE", "Asana Tasks").strip(),
+        enable_tasks=env_bool("ENABLE_TASKS_SYNC", True),
+        auto_create_tasks_table=env_bool("AUTO_CREATE_TASKS_TABLE", True),
+    )
+    asana = None
+    airtable = None
+
 secrets = SecretStore(settings.webhook_secret_store)
 app = FastAPI(title="Asana Airtable Live Sync")
 
@@ -429,6 +453,11 @@ app = FastAPI(title="Asana Airtable Live Sync")
 def require_admin_key(x_admin_key: Optional[str]) -> None:
     if settings.admin_api_key and x_admin_key != settings.admin_api_key:
         raise HTTPException(status_code=401, detail="Invalid admin key")
+
+
+def require_runtime_config() -> None:
+    if CONFIG_ERROR or asana is None or airtable is None:
+        raise HTTPException(status_code=500, detail=CONFIG_ERROR or "Service is misconfigured")
 
 
 def verify_signature(body: bytes, signature: str, secret: str) -> bool:
@@ -454,6 +483,7 @@ def join_gids(items: list[dict[str, Any]]) -> str:
 
 
 def maybe_task_table() -> None:
+    require_runtime_config()
     if not settings.enable_tasks:
         return
     if airtable.get_field_map(settings.tasks_table):
@@ -552,6 +582,7 @@ def delete_from_airtable(table_name: str, merge_field: str, merge_value: Any) ->
 
 
 def sync_goal(goal_gid: str) -> dict[str, Any]:
+    require_runtime_config()
     try:
         goal = asana.get_goal(goal_gid)
         parents = asana.get_goal_parents(goal_gid)
@@ -611,6 +642,7 @@ def sync_goal(goal_gid: str) -> dict[str, Any]:
 
 
 def sync_project(project_gid: str) -> dict[str, Any]:
+    require_runtime_config()
     try:
         project = asana.get_project(project_gid)
     except urllib.error.HTTPError as exc:
@@ -682,6 +714,7 @@ def sync_project(project_gid: str) -> dict[str, Any]:
 
 
 def sync_task(task_gid: str) -> dict[str, Any]:
+    require_runtime_config()
     maybe_task_table()
     if not settings.enable_tasks:
         return {"task_gid": task_gid, "skipped": True, "reason": "Tasks sync disabled"}
@@ -759,6 +792,12 @@ PROJECT_TASK_WEBHOOK_FILTERS = [
 
 @app.get("/")
 def root() -> dict[str, Any]:
+    if CONFIG_ERROR:
+        return {
+            "status": "misconfigured",
+            "service": "asana-data-layer",
+            "error": CONFIG_ERROR,
+        }
     return {
         "status": "ok",
         "service": "asana-data-layer",
@@ -769,6 +808,13 @@ def root() -> dict[str, Any]:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    if CONFIG_ERROR:
+        return {
+            "status": "misconfigured",
+            "error": CONFIG_ERROR,
+            "workspace_gid": settings.workspace_gid,
+            "base_id": settings.airtable_base_id,
+        }
     return {
         "status": "ok",
         "workspace_gid": settings.workspace_gid,
@@ -783,6 +829,7 @@ async def asana_workspace_webhook(
     x_hook_secret: Optional[str] = Header(default=None),
     x_hook_signature: Optional[str] = Header(default=None),
 ) -> Response:
+    require_runtime_config()
     key = f"workspace:{settings.workspace_gid}"
     body = await request.body()
 
@@ -819,6 +866,7 @@ async def asana_project_webhook(
     x_hook_secret: Optional[str] = Header(default=None),
     x_hook_signature: Optional[str] = Header(default=None),
 ) -> Response:
+    require_runtime_config()
     key = f"project:{project_gid}"
     body = await request.body()
 
@@ -851,6 +899,7 @@ async def asana_project_webhook(
 
 @app.post("/admin/bootstrap")
 def bootstrap_sync(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_runtime_config()
     require_admin_key(x_admin_key)
     maybe_task_table()
     workspace_webhook = asana.create_webhook(
@@ -880,6 +929,7 @@ def bootstrap_sync(x_admin_key: Optional[str] = Header(default=None)) -> dict[st
 
 @app.post("/admin/backfill/goals")
 def backfill_goals(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_runtime_config()
     require_admin_key(x_admin_key)
     goal_refs = dedupe_by_gid(asana.list_goals(False) + asana.list_goals(True))
     results = [sync_goal(goal["gid"]) for goal in goal_refs]
@@ -888,6 +938,7 @@ def backfill_goals(x_admin_key: Optional[str] = Header(default=None)) -> dict[st
 
 @app.post("/admin/backfill/projects")
 def backfill_projects(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_runtime_config()
     require_admin_key(x_admin_key)
     project_refs = dedupe_by_gid(asana.list_projects(False) + asana.list_projects(True))
     results = [sync_project(project["gid"]) for project in project_refs]
@@ -899,6 +950,7 @@ def backfill_tasks(
     project_gid: Optional[str] = None,
     x_admin_key: Optional[str] = Header(default=None),
 ) -> dict[str, Any]:
+    require_runtime_config()
     require_admin_key(x_admin_key)
     maybe_task_table()
 
@@ -919,6 +971,7 @@ def backfill_tasks(
 
 @app.post("/admin/backfill/all")
 def backfill_all(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_runtime_config()
     require_admin_key(x_admin_key)
     goals = backfill_goals(x_admin_key)
     projects = backfill_projects(x_admin_key)
@@ -928,6 +981,7 @@ def backfill_all(x_admin_key: Optional[str] = Header(default=None)) -> dict[str,
 
 @app.get("/admin/config")
 def config(x_admin_key: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_runtime_config()
     require_admin_key(x_admin_key)
     maybe_task_table()
     return {
